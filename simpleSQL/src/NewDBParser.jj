@@ -1,0 +1,2569 @@
+/*
+2010-12794 Joonsang Jo
+
+[Project 1-3]
+
+Overall Description
+:
+All errors are handled by classes named [query_name]ErrorHandler.java
+Data is organized in this way: Data list is contained in Record class, and records are contained in Table class. 
+
+[Special Data Structure]
+BooleanExpression.java was defined to effectively evaluate the comparative sentences.
+BooleanExpression interface was defined to construct tree,
+and the tree evaluates each comparative sentence by getting returned value from leaf comparative sentence.
+
+The comments were added to the parts in which explanation is necessary.
+
+*/
+
+options
+{
+  static = true;
+  DEBUG_PARSER = false;
+  IGNORE_CASE = true;
+  LOOKAHEAD=1;
+  FORCE_LA_CHECK = true;
+}
+
+PARSER_BEGIN(SimpleDBMSParser)
+
+import java.io.File;
+import java.io.IOException;
+import com.sleepycat.je.Database;
+import com.sleepycat.je.DatabaseException;
+import com.sleepycat.je.DatabaseConfig;
+import com.sleepycat.je.DatabaseEntry;
+
+import com.sleepycat.bind.EntryBinding;
+import com.sleepycat.bind.serial.StoredClassCatalog;
+import com.sleepycat.bind.serial.SerialBinding;
+
+import com.sleepycat.je.Cursor;
+import com.sleepycat.je.Environment;
+import com.sleepycat.je.EnvironmentConfig;
+import com.sleepycat.je.LockMode;
+import com.sleepycat.je.OperationStatus;
+import java.util.ArrayList;
+
+/* Environment & Database definition */
+
+public class SimpleDBMSParser
+{
+  public static final int PRINT_SYNTAX_ERROR = 0;
+  public static final int PRINT_CREATE_TABLE = 1;
+  public static final int PRINT_DROP_TABLE = 2;
+  public static final int PRINT_DESC = 3;
+  public static final int PRINT_INSERT = 4;
+  public static final int PRINT_DELETE = 5;
+  public static final int PRINT_SELECT = 6;
+  public static final int PRINT_SHOW_TABLES = 7;
+  public boolean isOver = false;
+
+  public static Environment myDbEnvironment = null;
+  public static Database myDatabase = null;
+  public static Database myClassDb = null;
+  public static StoredClassCatalog classCatalog = null;
+  public static EntryBinding dataBinding = null;
+  public static Table tempTable;
+  public static Table dqTable;
+  public static Table mergedTable;
+  public static CreateErrorHandler createErrorHandler;
+  public static InsertErrorHandler insertErrorHandler;
+  public static DeleteErrorHandler deleteErrorHandler;
+  public static WhereErrorHandler whereErrorHandler;
+  public static SelectErrorHandler selectErrorHandler;
+  public static Record record;
+  public static ArrayList<String> cRenameList;
+
+  /* The error information is needed to interact with 'CreateErrorHandler' class. */
+  public static final int DuplicateColumnDefError = 1;
+  public static final int DuplicatePrimaryKeyDefError = 2;
+  public static final int ReferenceTypeError = 3;
+  public static final int ReferenceNonPrimaryKeyError = 4;
+  public static final int ReferenceColumnExistenceError = 5;
+  public static final int ReferenceTableExistenceError = 6;
+  public static final int NonExistingColumnDefError = 7;
+  public static final int TableExistenceError = 8;
+  public static final int CharLengthError = 9;
+  
+     
+  public static void main(String args[]) throws ParseException
+  {
+
+      /* Opening DB */
+
+	// Open Database Environment or if not, create one.
+
+	EnvironmentConfig envConfig = new EnvironmentConfig();
+	envConfig.setAllowCreate(true);
+	myDbEnvironment = new Environment(new File("db/"), envConfig);
+
+	// Open Database or if not, create one.
+
+	DatabaseConfig dbConfig = new DatabaseConfig();
+	dbConfig.setAllowCreate(true);
+	dbConfig.setSortedDuplicates(true);
+	myDatabase = myDbEnvironment.openDatabase(null, "myDb", dbConfig);
+	dbConfig.setSortedDuplicates(false);
+	/* Since this program uses 'Table' object as a value in key-value pair data in Berkeley DB,
+	additional database is required. */
+	myClassDb = myDbEnvironment.openDatabase(null, "classDb", dbConfig);
+
+	// Instantiate the class catalog
+	classCatalog = new StoredClassCatalog(myClassDb);
+
+	// Create the binding
+	dataBinding = new SerialBinding(classCatalog, Table.class);
+
+	createErrorHandler = new CreateErrorHandler();
+	record = new Record();
+  
+    SimpleDBMSParser parser = new SimpleDBMSParser(System.in);
+    System.out.print("DB_2010-12794> ");
+
+    while (true)
+    {
+      tempTable = new Table();      
+      
+      try
+      {
+        if(parser.command(tempTable).equals("exit")) { 
+        	
+			/* CLOSING DB only if I entered "exit" */
+						
+			if(myDatabase != null) myDatabase.close();
+			if(myClassDb != null) myClassDb.close();
+			if(myDbEnvironment != null) myDbEnvironment.close();
+
+        	System.exit(0);
+        	
+        }
+         
+      }
+      catch (Exception e)
+      {
+        System.out.println(e.getMessage()); 
+        createErrorHandler.initialize();        
+        printMessage(PRINT_SYNTAX_ERROR);
+        SimpleDBMSParser.ReInit(System.in);
+      }
+     
+    }
+
+  }
+
+  /* This method is called at the last step of processing a 'create table' query.
+	 Before inserting a table data to the database, it checks whether there is any invalid condition.
+  */
+  public static void createTable(Table tb) { 
+
+
+	/* DuplicateColumnError detect! */
+	if(tb.isThereDupColumn()) {
+		createErrorHandler.errorDetected(DuplicateColumnDefError);
+	}
+
+	// error check 'create table error list.'
+	if(createErrorHandler.isThereError()) {
+		createErrorHandler.printError();
+		createErrorHandler.initialize();
+		tb.recycle(); // must be recycled.		
+		return; 
+	}
+	
+	Table table = tb;
+
+	table.setRecordConstraint();
+
+	String key = table.getTableName();
+
+	try {
+	  DatabaseEntry theKey = new DatabaseEntry(key.getBytes("UTF-8"));
+	  DatabaseEntry theData = new DatabaseEntry();
+	  dataBinding.objectToEntry(table, theData);
+	  
+	  myDatabase.put(null, theKey, theData); 
+	} catch (Exception e) {
+		System.out.println(e.getMessage()); 
+	}
+
+	table.recycle(); // must be recycled.
+
+	System.out.println("'" + key + "'" + " table is created");
+
+  }
+  /* This method checks whether the data type 'char' satisfies the condition
+  that char length is greater than 0.*/
+  public static String inspectCharLength(String numString) {
+
+	int numInt = 0;
+	boolean numIntParsable = true;
+
+	if(numString.charAt(0) == '-') {
+		createErrorHandler.errorDetected(CharLengthError);
+	}
+
+	if(numString.charAt(0) == '+')
+		numString = numString.substring(1);		
+	
+	try {
+	  numInt = Integer.parseInt(numString); 
+	} catch (NumberFormatException e) {
+		numIntParsable = false;
+	}
+
+	if (numInt < 1) {
+		createErrorHandler.errorDetected(CharLengthError);		
+		return String.valueOf(numInt);		
+	} 
+		return numString;
+		
+  }
+
+  /* This method checks whether there exists a table with the same name in the database. */
+  public static boolean doesTableExist(String tableName) {
+
+	try { 
+		DatabaseEntry theKey = new DatabaseEntry(tableName.getBytes("UTF-8"));
+		DatabaseEntry theData = new DatabaseEntry();
+
+		if(myDatabase.get(null, theKey, theData, LockMode.DEFAULT) == OperationStatus.SUCCESS) {
+			return true;
+		 }
+		else {
+			return false;		
+		}
+	} catch (Exception e) {
+		System.out.println(e.getMessage());
+		return true; 
+	} 
+  }
+
+  
+  /* This method checks whether all columns in list exist in the table. */
+  public static boolean nonExistingColumnCheck(Table table, ArrayList<String> l1) {
+
+	for(int i=0; i<l1.size(); i++) {
+			if(table.isColumnInTable(l1.get(i))) {
+			  //여기도 break 필요해 보임.
+			} else {
+			  // Only if process enters here, it is an error.
+			  createErrorHandler.setNotExistingColName(l1.get(i));
+			  createErrorHandler.errorDetected(NonExistingColumnDefError);
+			  return true;				
+			}		
+  	}
+
+  	return false;
+  }
+
+
+  /* If there is an error related to the reference case, then this method returns true, otherwise return false. */
+ public static boolean refRelatedErrorCheck(Table tb, ArrayList<String> l1, String refTableName, ArrayList<String> l2) {
+		
+		Table refTable = getTableByName(refTableName);
+		if(refTable == null) {
+			createErrorHandler.errorDetected(ReferenceTableExistenceError);
+			return true;
+		}
+
+		if(nonExistingColumnCheck(tb, l1)) { return true; }  //// check whether referencing column exists in current table.
+		if(nonExistingColumnCheck(refTable, l2)) { return true; } //// check whether referenced column exists in the target table.
+		
+		for(int j=0; j<l2.size(); j++) {
+			if(refTable.isColumnInTable(l2.get(j))) {
+
+			} else {
+			  createErrorHandler.errorDetected(ReferenceColumnExistenceError);
+			  return true; ////
+			}
+		}
+
+
+		if(l1.size() != l2.size()) {
+			createErrorHandler.errorDetected(ReferenceTypeError);
+			return true; ////
+		}
+		else {
+			for(int k=0; k<l1.size(); k++) {
+				if(tb.getColumnType(l1.get(k)).equals(refTable.getColumnType(l2.get(k)))) {
+						
+						if(!refTable.arePrimaryKeys(l2)) { 
+							createErrorHandler.errorDetected(ReferenceNonPrimaryKeyError);
+							return true; ////
+					  	}
+				  
+				} else {
+					// Only if process enters here, it is an error.
+					createErrorHandler.errorDetected(ReferenceTypeError);
+					return true; ////
+				}				
+			}				
+		}
+
+		/* If there is at least an error, it returns true, otherwise false. */
+		if(createErrorHandler.isThereError())
+			return true;
+		else
+			return false;		
+		 
+  }
+  
+  /* This method is used to get Table in the database by name
+	 On success, it returns the reference of Table object.
+	 On failure, it returns null value.
+  */
+  public static Table getTableByName(String tableName) {
+
+	try { 
+
+		DatabaseEntry theKey = new DatabaseEntry(tableName.getBytes("UTF-8"));
+		DatabaseEntry theData = new DatabaseEntry();
+
+		if(myDatabase.get(null, theKey, theData, LockMode.DEFAULT) == OperationStatus.SUCCESS) {
+
+			Table retrievedTable = (Table) dataBinding.entryToObject(theData);
+			return retrievedTable;
+	  	}
+	    else {
+			return null; 
+		}
+		
+	} catch (Exception e) {
+		System.out.println(e.getMessage());
+		return null; 
+	}
+  }
+
+  public static void tableExistenceError() {
+	System.out.println("Create table has failed: table with the same name already exists");
+  }
+   
+  /* This method is used to simply delete table from database for update. */
+  public static void deleteTableForUpdate(String tableName) {
+
+	try { 
+		DatabaseEntry theKey = new DatabaseEntry(tableName.getBytes("UTF-8"));
+		if(myDatabase.delete(null, theKey) == OperationStatus.SUCCESS) {
+
+	    } else {
+			return;
+	    }
+	} catch (Exception e) {
+		System.out.println(e.getMessage()); 
+	}
+  }
+  
+  /* This method is used to simply insert table from database for update. */
+  public static void insertTableForUpdate(Table table) {
+
+	String tableName = table.getTableName();
+	
+	try {
+	  DatabaseEntry theKey = new DatabaseEntry(tableName.getBytes("UTF-8"));
+	  DatabaseEntry theData = new DatabaseEntry();
+	  dataBinding.objectToEntry(table, theData);
+	  
+	  myDatabase.put(null, theKey, theData); 
+	} catch (Exception e) {
+		System.out.println(e.getMessage()); 
+	}
+
+  }
+
+  /* This method is called when 'drop table' query is processed. */
+  public static void dropTable(String tableName) {
+
+	Table targetTable = getTableByName(tableName);
+	if(targetTable == null) {
+		System.out.println("No such table");
+		return;
+	}
+	
+	/* If the target table is being referenced by other tables, then it must print the error message and return. */
+	if(targetTable.isReferencedBy()) {
+		System.out.println("Drop table has failed: " + "'" + tableName + "'" + " is referenced by other table");	  
+		return;
+	}
+
+	/* If the target table is referencing other tables,
+	   then this table information must be removed in the other tables' member variable 'isReferencedBy'.
+	*/
+	ArrayList<String> referringList = targetTable.getReferringList();
+
+	// 이제 referringList에 등장하는 테이블들의 referredList에서 삭제될 테이블의 이름을 빼고, 다시 DB에 넣어줘야 함.
+	for(int i=0; i<referringList.size(); i++) {
+
+	  String toBeUpdatedTableName = referringList.get(i);
+
+	  Table toBeUpdatedTable = getTableByName(toBeUpdatedTableName);
+	  if(toBeUpdatedTable == null) {
+			//Don't need to be worried about this line. If referringList has no element, the for loop never executes.
+	   }
+
+	  toBeUpdatedTable.deleteReferencedTable(tableName); 
+
+	  deleteTableForUpdate(toBeUpdatedTable.getTableName());
+	  insertTableForUpdate(toBeUpdatedTable);	// same as overwriting.
+	} 
+
+
+	try { 
+		DatabaseEntry theKey = new DatabaseEntry(tableName.getBytes("UTF-8"));
+
+		if(myDatabase.delete(null, theKey) == OperationStatus.SUCCESS) {
+
+			System.out.println("'" + tableName + "'" + " table is dropped");   
+	    } else {
+			System.out.println("No such table");
+			return;
+	    }
+	} catch (Exception e) {
+
+		System.out.println(e.getMessage()); 
+	}
+
+   }
+  /* This method is used to reflecting the change regarding references in the database. */
+  public static void refInfoUpdate(Table tb, String tableName) {
+
+	Table targetTable = getTableByName(tableName); 
+	if(targetTable == null) {
+		return;
+	} else {
+	    /* If there is a change in a certain value,
+	    (1) The table must be extracted from the database.
+	    (2) The change must be reflected to the extracted table.
+	    (3) The changed table must be reinserted to the database.  */
+		targetTable.connectRefTableInfo(tb.getTableName()); 
+		deleteTableForUpdate(tableName);
+		insertTableForUpdate(targetTable);		
+	}
+  }
+  /* This method is called when 'desc ['#tablename']' query is processed. */
+  public static void desc(String tableName) {
+
+	try { 
+		DatabaseEntry theKey = new DatabaseEntry(tableName.getBytes("UTF-8"));
+		DatabaseEntry theData = new DatabaseEntry();
+
+		if(myDatabase.get(null, theKey, theData, LockMode.DEFAULT) == OperationStatus.SUCCESS) {
+
+			Table retrievedData = (Table) dataBinding.entryToObject(theData);
+			System.out.println("-------------------------------------------------");
+			System.out.println("table_name [" + tableName +"]");
+			System.out.println(String.format("%-20s %-10s %-7s %-8s", "column_name", "type", "null", "key")); 
+
+			for(int i=0; i<retrievedData.getColumnLength(); i++) {
+		  		columnInfo tempCNT = retrievedData.getColumnInfo(i);
+		  		String keyInfo = setKeyInfo(tempCNT);
+		  		String nullInfo = setNullInfo(tempCNT);
+		  					  				  		 		  
+				System.out.println(String.format("%-20s %-10s %-7s %-8s", tempCNT.columnName, tempCNT.columnType, nullInfo, keyInfo));
+		 }
+		 	System.out.println("-------------------------------------------------");
+			
+	  }
+	  else {
+		System.out.println("No such table");
+	   }
+	  } catch (Exception e) {
+		System.out.println(e.getMessage()); 
+	}
+
+  }
+
+  public static String setKeyInfo(columnInfo c) {
+
+	String keyInfo;
+	
+	if (c.getPrimaryKey() && c.getForeignKey()) { 
+		keyInfo = "PRI/FOR";
+	} else if (c.getPrimaryKey()) { 
+		keyInfo = "PRI";
+	} else if (c.getForeignKey()) {
+	  	keyInfo = "FOR";
+	} else
+		keyInfo = "";
+
+	return keyInfo;
+   }
+    
+  public static String setNullInfo(columnInfo c) {
+
+	String nullInfo;
+	
+	if (c.getNotNull()) {
+		nullInfo = "N";
+	} else {
+		nullInfo = "Y";
+	}
+
+	return nullInfo;
+  }
+  
+  /* This method is called when 'show tables' query is processed. */
+  public static void showTables() {
+
+	Cursor myCursor = null;
+// There is no table must be added.
+	try {
+
+		boolean isEmpty = true;
+		myCursor = myDatabase.openCursor(null, null);
+
+		DatabaseEntry foundKey = new DatabaseEntry();
+		DatabaseEntry foundData = new DatabaseEntry();
+
+		if (myCursor.getNext(foundKey, foundData, LockMode.DEFAULT) == OperationStatus.SUCCESS) {
+			isEmpty = false;
+			System.out.println("----------------");
+			Table retrievedData = (Table) dataBinding.entryToObject(foundData);
+			System.out.println(retrievedData.getTableName());
+		} else {
+			System.out.println("There is no table");
+		}
+
+		while (myCursor.getNext(foundKey, foundData, LockMode.DEFAULT) == OperationStatus.SUCCESS) {
+
+				Table retrievedData = (Table) dataBinding.entryToObject(foundData);
+				System.out.println(retrievedData.getTableName());
+		}
+		
+		if(!isEmpty)
+			System.out.println("----------------");
+
+	
+		myCursor.close();
+		
+	} catch (Exception e) {
+		System.out.println(e.getMessage()); 
+	}
+    
+  }
+
+  /* If primary key check has not detected any problems, it returns true.
+  Otherwise, it returns false. */
+  public static boolean primaryKeyCheck(Table targetTable) {
+
+	ArrayList<String> primaryKeyList = targetTable.getPrimaryKeys();
+	
+
+	if(primaryKeyList.size() == 0)
+		return true;
+
+	if(targetTable.getRecord().getDataListSize() == 0) // 현재 아무런 데이터도 가지고 있지 않을 때! 
+		return true;
+
+	ArrayList<Integer> primaryKeyIndex = new ArrayList<Integer>();
+
+	for(int i=0; i<primaryKeyList.size(); i++) {
+		int pIndex = targetTable.getColumnIndex(primaryKeyList.get(i));
+		primaryKeyIndex.add(pIndex);
+	}
+
+	ArrayList<Data> actualDataList = targetTable.getRecord().getDataList();
+	int numOfColumns = targetTable.getColumnNTLength(); // jump단위 
+
+	for(int j=0; j< actualDataList.size(); j+=numOfColumns) {
+		int counter = 0;
+	  
+		for(int k=0; k<primaryKeyIndex.size(); k++) {
+			int tempIdx = primaryKeyIndex.get(k);
+			String actualData = actualDataList.get(j+tempIdx).getData();
+			String inputData = record.getDataList().get(tempIdx).getData();
+			/* inputData에서 quote를 빼줘야 함.*/
+
+
+			// 위에서 type check가 제대로 된다는 가정 하에.
+			if(inputData.contains("'")) {
+				actualData = "'" + actualData + "'";
+			}
+			
+			if(actualData.equals(inputData)) {
+				counter++;
+			}			
+		}
+
+		if(counter == primaryKeyList.size()) {
+		  	// If the code reaches here, it detects that the same primary keys are being inserted. 
+			return false;
+		}
+	}
+
+	return true;
+	
+  }
+
+  /* If primary key check has not detected any problems, it returns true.
+  Otherwise, it returns false. */
+  public static boolean foreignKeyCheck(Table targetTable) {
+
+// contains를 활용. contains("해당컬럼"), contains("해당컬럼") && contains("/")
+// 여기 들어올 때 column 순서로 정렬되어 있음.
+	/* input 형태 insert into momo values (id, name ,salary, department)라고 할 때,
+		Foreign keys에서 값을 하나씩 읽은 다음에, 그것에 해당하는 column의 값이 null인이 아닌지 체크하면 됨. 
+	*/
+	
+	ArrayList<String> foreignKeySets = targetTable.getForeignKeySets();
+
+	for(int z=0; z<foreignKeySets.size(); z++) {
+
+		if(foreignKeySets.get(z).contains("/")) {
+		
+			String fColumn = foreignKeySets.get(z);
+
+			/* referring table name은 지금 당장은 필요 없으므로 잘라낸다.*/
+			for(int k=0; k<fColumn.length(); k++) {
+				if(fColumn.charAt(k) == ']') {
+					fColumn = fColumn.substring(k+1, fColumn.length());
+				  }
+			}
+			
+			ArrayList<String> fSet = new ArrayList<String>();
+
+			for(int i=0, j=0; i<fColumn.length(); i++) {
+				if(fColumn.charAt(i) == '/' || i == fColumn.length()-1) {
+
+				  	if(i == fColumn.length()-1) {
+						fSet.add(fColumn.substring(j, i+1));
+				  	}
+				  	else {
+						fSet.add(fColumn.substring(j, i));
+				  	}					
+
+					j = i+1;
+				 }
+			} // for문의 결과 /가 빠진 ArrayList가 만들어짐. 
+			// ArrayList를 순회하며 컬럼의 value가 하나라도 null이면 continue; 모두 null이 아니면 false.
+
+			for(int k=0; k<fSet.size(); k++) {
+				String tempColumn = fSet.get(k);
+				int tempColumnIndex = targetTable.getColumnIndex(tempColumn);
+
+				if(record.getDataList().get(tempColumnIndex).getData().equals("null")) {
+				  	return true;
+					
+				}
+				// 위에서 return하지 않으면 null이 하나도 없다는 뜻이다. 따라서 아래의 검사를 실시해야 함. 
+			}
+			
+			// "/"의 개수를 센 다음에, 거기에 1을 더한 것만큼 for문을 돌려서, 하나라도 null이면 continue, null 아니면 return false.
+			
+		} else {
+			String fColumn = foreignKeySets.get(z);
+
+			/* tablename잘라내기 */
+			for(int k=0; k<fColumn.length(); k++) {
+				if(fColumn.charAt(k) == ']') {
+					fColumn = fColumn.substring(k+1, fColumn.length());
+				  }
+			}
+			
+			int fColumnIndex = targetTable.getColumnIndex(fColumn);
+
+			if(record.getDataList().get(fColumnIndex).getData().equals("null")) 
+				return true;						
+		}
+
+	}
+
+
+	/* 여기서 foreign key constraint 검사 하기
+		1. 포함되는지.
+		2. getNewList && isPutAllowed
+	*/
+	try { 
+		Table tempTable = targetTable;
+		Table referringTable = null;
+		ArrayList<String> anotherFSets = tempTable.getAnotherFSets();
+		ArrayList<String> originalFSets = tempTable.getForeignKeySets();
+
+		if(anotherFSets.size() != 0) { 
+	
+			String recordColumns = record.makeForeignKeySet();
+
+			for(int i=0; i<anotherFSets.size(); i++) {
+				String tempString = anotherFSets.get(i);
+				boolean flag = true;
+		
+				if(tempString.contains("/")) { // 두개 이상일때, 
+								   		
+					String[] fSet = tempString.split("/");
+			
+					for(int j=0; j<fSet.length; j++) {
+						if(!(recordColumns.contains(fSet[j]))) {
+							flag = false;
+						}
+					}
+				} else { // 길이가 1일때, 
+					if(!(recordColumns.contains(tempString))) {
+						flag = false;
+					}
+				}
+		
+				// 이 라인까지는 괜찮음. 
+				if(flag == true) { // 집어넣는 레코드에 foreign key set이 다 들어가 있다는 얘기.
+					int endIdx = 1;
+					String referTableName ="";
+	
+		  			for(int k=0; k<originalFSets.get(i).length(); k++) {
+						// 컬럼이 하나만 있을 때는 안 넣나?[]
+						if(originalFSets.get(i).charAt(k) == ']') {
+							endIdx = k;
+						}
+		  			}
+					
+					referTableName = originalFSets.get(i).substring(1, endIdx);
+		  			referringTable = getTableByName(referTableName);		  	
+					break;
+			  	}
+		} // for-loop end.
+
+		if (!(referringTable == null)) {
+			ArrayList<Data> newList = getNewList(targetTable, referringTable, null);
+			if(isPutAllowed(record, targetTable, referringTable, newList) == true)
+				return true;
+			else
+				return false; 		 
+		
+		}
+	}
+ 
+	} catch(Exception e) {
+		System.out.println(e.getMessage());
+		System.err.println(e);	
+  	}
+		
+	return true; //위에서 검출되지 않으면 true!!
+  }
+
+
+  public static void insertValues(Table targetTable) {
+
+	if(!insertErrorHandler.isThereError()) { // 이 모든 검사는 targetTable이 null이 아닐 때 가능.
+		if(!targetTable.getRecord().isTypeLegal(record)) {	// 여기서 조건 검사 적절한가?		
+			  insertErrorHandler.errorDetected(4); // Type Mismatch Error.
+		}	
+	}
+
+	if(!insertErrorHandler.isThereError()) { 
+		/* Check whether a certain column is nullable or not.  */
+		ArrayList<Data> dataList = record.getDataList();
+
+		for(int i=0; i<dataList.size(); i++) {
+			if(dataList.get(i).getData().equals("null"))
+				if(targetTable.getColumnInfo(i).getNotNull() == true) { 
+					insertErrorHandler.errorDetected(6);
+					insertErrorHandler.setNonNullableColumn(targetTable.getColumnInfo(i).getColumnName());
+					break;
+				}	
+		}
+	}
+
+	if(!insertErrorHandler.isThereError()) { 
+	  
+		/* Primary Key Constraint Check. */
+		if(primaryKeyCheck(targetTable) == false) {
+			insertErrorHandler.errorDetected(2);			
+		}
+	}
+
+	if(!insertErrorHandler.isThereError()) { 
+		if(foreignKeyCheck(targetTable) == false) {
+			insertErrorHandler.errorDetected(3);
+		}
+	}
+		  				
+    /* 발견된 에러가 있으면 밑의 DB update 과정을 진행하지 않는다. */
+	if(insertErrorHandler.isThereError()) {
+	  	insertErrorHandler.printError();
+	  	insertErrorHandler.initialize();
+	  	record.initialize();
+		return;
+	}
+	// 여기에 와야 맞는 것 같은데;
+
+	/* 만약 다른 데에서 에러가 없을 경우, TRUNCATE를 하고 마친다.*/
+	
+	int columnNTSize = targetTable.getColumnNTLength();
+
+	for(int i=0; i<columnNTSize; i++) {
+		String tempData = record.getDataList().get(i).getData();
+				
+		if(tempData.contains("'")) { // meaning its data type is 'char'
+			int lengthConstraint = targetTable.getColumnInfo(i).getCharColumnLength(); //이 라인이 문제.
+			String tempStr = "";	
+
+			tempData = tempData.substring(1, tempData.length()-1);
+
+			for(int j=0; j<lengthConstraint; j++) {
+			  	if(j == tempData.length())
+			  		break;
+				tempStr = tempStr + tempData.charAt(j);
+			}
+		
+			record.getDataList().set(i, new Data(tempStr, i, targetTable.getColumnInfo(i).getColumnName(), targetTable.getColumnInfo(i).getColumnType()));
+
+			}			
+	}
+	
+	targetTable.getRecord().addDataList(record.getDataList());
+	deleteTableForUpdate(targetTable.getTableName());
+	insertTableForUpdate(targetTable);	
+    record.initialize();
+
+	System.out.println("The row is inserted");
+    
+    return;
+  }
+
+
+public static void setFlagsToDelete(Table dqReferTable, ArrayList<Data> newList, ArrayList<Integer> flagList) {
+	/*
+	1. dqReferTable에서 dataList를 가져온다.
+	2. 아까와 같이 foreignKeys가 String으로 encode된 index번호를 return 받는다.
+	3. for loop에서 각각의 컬럼을 다 비교한 후에, 모두 일치하면 각각의 컬럼 값들을 null로 바꿔준다. (O)
+	 */
+
+	ArrayList<Data> dqReferDataList = dqReferTable.getRecord().getDataList(); // 1.(O)
+	String foreignKeySet = dqReferTable.getForeignKeySet(dqTable.getTableName());
+	String encodedIndex = dqReferTable.getMappedIndex(foreignKeySet);
+	String[] decodedIndex = encodedIndex.split("/");
+	int numOfColumns1 = dqReferTable.getColumnNTLength();
+	int numOfColumns2 = decodedIndex.length;
+
+	ArrayList<String> combinatedList = new ArrayList<String>();
+	/* 비교를 편하게 하기 위해, combinatedList를 만들 필요 있음. */
+
+	// newList = 삭제 대상에 해당하는 record들 중에 primary key column에 해당하는 value만 dqTable의 순서에 맞게 ArrayList로 뽑아옴.
+	for(int k=0; k<newList.size(); k++) {
+
+		String dataCombination = "";
+		
+		if(k % numOfColumns2 == 0) {
+			for(int p=k; p<k+numOfColumns2; p++) {
+				dataCombination = dataCombination + newList.get(p).getData() + "/";
+			}	
+			combinatedList.add(dataCombination);			
+		}
+	}
+	
+
+	for(int i=0; i<dqReferDataList.size(); i++) {
+		if(i % numOfColumns1 == 0) { // 한줄씩.
+
+			String dataCombination = "";			
+			for(int j=0; j<decodedIndex.length; j++) {
+				int idx = Integer.parseInt(decodedIndex[j]);
+				dataCombination = dataCombination + dqReferDataList.get(i+idx).getData() + "/";
+			 }
+			
+			for(int j=0; j<combinatedList.size(); j++) {
+				if(combinatedList.get(j).equals(dataCombination)) { //primary key 한줄과 foreign key한줄이 같을 때,
+					
+					if(deleteCascadeCheck(dqReferTable.getTableName()) == -1) { // 하나라도 nullable하지 않으면, 그 라인은 지울 수 없음.
+						flagList.set(j, -1);	
+					}
+				 }				
+			 }
+		}			 
+	}
+		
+}
+
+public static void beforeDeleting(ArrayList<String> deleteIndexList) { 
+
+	// delete counter
+	// delete index를 한 줄씩 적용하면서 봐야 함.
+	// 이하의 모든 코드는 dqTable이 참조되고 있을 때만 작동함.
+  if(dqTable.isReferencedBy()) {
+
+	ArrayList<String> dqReferringList = dqTable.getReferencedList();
+
+	// 하나의 row에 대해 검사를 해야 함.
+	// 참조하는 테이블에 그 row의 record 있는지 다 확인해야 함.
+	// getNewList를 바꿔야될수도
+	// getNewList와 deleteIndexList의 개수는 같음. get
+
+	ArrayList<Integer> flagForNewList = new ArrayList<Integer>();
+	for(int i=0; i<deleteIndexList.size(); i++) {
+		if(deleteIndexList.get(i).equals("1")) {
+			flagForNewList.add(1);
+		}
+	}
+	// newList에 대한 index처럼 기능하게 됨. 
+
+	for(int i=0; i<dqReferringList.size(); i++) {
+	  	Table tempDQReferTable = getTableByName(dqReferringList.get(i));
+	  	ArrayList<Data> newList = getNewList(tempDQReferTable, dqTable, deleteIndexList);
+		setFlagsToDelete(tempDQReferTable, newList, flagForNewList); // setFlags에 문제가 있음.
+	}
+
+	// deleteIndexList를 재설정한다.
+	for(int i=0, j=0; i<deleteIndexList.size(); i++) {
+		if(deleteIndexList.get(i).equals("1")) {
+			if(flagForNewList.get(j++) == -1) {
+				deleteIndexList.set(i, "0");
+			}
+		}	
+	}
+
+	/* 삭제할 수 없는 것은 dqReferringTable에 dqTable과 똑같은 data가 있는데, 그게 not nullable할 때, */
+	
+
+	// 위에서 deleteIndexList에 대한 정보가 바뀌어야 함.
+
+	/* 삭제할 수 있는 것에 대해서만 null을 집어 넣는다. */
+	// 복잡하니까 for loop 분리. 
+	for(int i=0; i<dqReferringList.size(); i++) {
+	  	// for loop을 돌면서 각각의 dqReferringTable마다 맞춤형 arrayList를 제공해서, null값 넣는 것을 수월하게 해줘야 됨.
+	  	String dqReferTableName = dqReferringList.get(i);
+	  	if(deleteCascadeCheck(dqReferTableName) == 1) { // 모두 nullable한 경우. 
+		  	Table dqReferTable = getTableByName(dqReferTableName);
+	  	// 여기서 함수호출	  	
+		  	ArrayList<Data> newList = getNewList(dqReferTable, dqTable, deleteIndexList); // 가공된 리스트를 만들고,
+	  		putNull(dqReferTable, newList, deleteIndexList);
+	  	// 이 리스트와 ArrayList<String> deleteIndexList를 받아서, putNull하는 함수 만들어야 함.  
+		}
+	}
+	}
+}
+
+
+  public static void putNull(Table dqReferTable, ArrayList<Data> newList, ArrayList<String> deleteIndexList) {
+	/*
+	1. dqReferTable에서 dataList를 가져온다.
+	2. 아까와 같이 foreignKeys가 String으로 encode된 index번호를 return 받는다.
+	3. for loop에서 각각의 컬럼을 다 비교한 후에, 모두 일치하면 각각의 컬럼 값들을 null로 바꿔준다. (O)
+	4. 최종적으로 db에 update해야됨. (O)		
+	 */
+
+	ArrayList<Data> dqReferDataList = dqReferTable.getRecord().getDataList(); // 1.(O)
+	String foreignKeySet = dqReferTable.getForeignKeySet(dqTable.getTableName());
+	String encodedIndex = dqReferTable.getMappedIndex(foreignKeySet);
+	String[] decodedIndex = encodedIndex.split("/");
+	int numOfColumns1 = dqReferTable.getColumnNTLength();
+	int numOfColumns2 = decodedIndex.length;
+
+	ArrayList<String> combinatedList = new ArrayList<String>();
+	/* 비교를 편하게 하기 위해, combinatedList를 만들 필요 있음. */
+
+	for(int k=0; k<newList.size(); k++) {
+
+		String dataCombination = "";
+		
+		if(k % numOfColumns2 == 0) {
+			for(int p=k; p<k+numOfColumns2; p++) {
+				dataCombination = dataCombination + newList.get(p).getData() + "/";
+			}	
+			combinatedList.add(dataCombination);
+		}
+
+	}
+
+	for(int i=0; i<dqReferDataList.size(); i++) {
+		if(i % numOfColumns1 == 0) { // 한줄씩.
+
+			String dataCombination = "";
+			boolean nullAllow = false;
+			
+			for(int j=0; j<decodedIndex.length; j++) {
+				int idx = Integer.parseInt(decodedIndex[j]);
+				dataCombination = dataCombination + dqReferDataList.get(i+idx).getData() + "/";
+			 }
+			
+			for(int j=0; j<combinatedList.size(); j++) {
+				if(combinatedList.get(j).equals(dataCombination)) {
+					nullAllow = true;
+				 }				
+			 }
+			// combinatedList에 dataCombination이 들어가 있으면, 해당 column들의 record 값에 null 집어 넣어야됨.
+			 if(nullAllow) {
+				for(int k=0; k<decodedIndex.length; k++) {
+					int idx = Integer.parseInt(decodedIndex[k]);
+					dqReferDataList.get(i+idx).changeIdentifier("null");
+			 	}
+			  }			 
+		}
+	}
+
+	deleteTableForUpdate(dqReferTable.getTableName());
+	insertTableForUpdate(dqReferTable);
+	
+
+  }
+
+  /* 삭제 대상에 해당하는 record들 중에 primary key column에 해당하는 value만 ArrayList로 뽑아옴. */
+  public static ArrayList<Data> getNewList(Table dqReferTable, Table dqTable, ArrayList<String> deleteIndexList) {
+	/*
+		1.dqReferTable에서 mappedKeys를 꺼내온다.
+		2.mappedKeys를 인자로 dqTable의 메소드에 보내서, String으로 encode된 index 번호를 return 받는다.
+		3.String[] 로 split한다.
+		4.dqTable에서 dataList를 받아온 다음에, String[]에 들어 있는 index 순서대로 dataList를 재구성한다.
+		ex) 5, 2, 7일 경우, 한 row 당 5,2,7의 순서로 data를 뽑아서 arrayList를 만든다.  
+		5. deleteIndexList에 해당하는 애들만 뽑아야 됨. 
+	*/	
+	String mappedKeySet = dqReferTable.getMappedKeySet(dqTable.getTableName()); // 1.(O)
+	String encodedIndex = dqTable.getMappedIndex(mappedKeySet); // 2.(O)
+	String[] decodedIndex = encodedIndex.split("/"); // 3.(O)
+	int numOfColumns = dqTable.getColumnNTLength();
+
+	ArrayList<Data> dataList = dqTable.getRecord().getDataList();
+	ArrayList<Data> newList = new ArrayList<Data>();
+
+	if(deleteIndexList != null) { 
+
+	/* dqTable에서 deleteIndexList에 해당하는 애들만 뽑는다. */
+	for(int i=0, rowNum = 0; i<dataList.size(); i++) {
+		if(i % numOfColumns == 0) {
+		  	if(deleteIndexList.get(rowNum).equals("1")) { 
+				for(int j=0; j<decodedIndex.length; j++) { // foreign key references에 지정된 순서대로 값이 들어감.
+					int idx = Integer.parseInt(decodedIndex[j]);
+					newList.add(dataList.get(i+idx));
+				}
+			}
+			rowNum++;
+		}
+	}
+	}
+	else {
+
+		for(int i=0; i<dataList.size(); i++) {
+			if(i % numOfColumns == 0) {
+				for(int j=0; j<decodedIndex.length; j++) { // foreign key references에 지정된 순서대로 값이 들어감.
+					int idx = Integer.parseInt(decodedIndex[j]);
+					newList.add(dataList.get(i+idx));
+				}
+			}
+			
+		}
+	}
+
+					
+	return newList;
+	
+  } 
+
+  /* 사실상 isAllNullable을 호출하기 위한 함수. 이 함수를 통해 delete의 방식이 결정된다. */
+  public static int deleteCascadeCheck(String tableName) {
+	
+		Table dqReferringTable = getTableByName(tableName);
+
+		String referringForeignKeys = dqReferringTable.getWhichColumnsReferTo(dqTable.getTableName());
+
+		if(dqReferringTable.isAllNullable(referringForeignKeys)) 
+			return 1;
+		else
+			return -1;				
+  }
+
+  public static void finalStepToDelete(ArrayList<String> deleteIndexList) {
+
+	// deleteIndexList에 "1"로 표시되어 있는 열들을 지우고, "0"은 살려 둔다.
+	// "1"로 표시되어 있는 index의 첫번째 Data 값에 allowDelete를 true로 바꾼다.
+
+	Record tempRecord = dqTable.getRecord();
+	ArrayList<Data> dataList = tempRecord.getDataList();
+	int numOfColumns = dqTable.getColumnNTLength();
+
+	/* deleteCascadeCheck를 해서, 세 가지 경우로 나눈 다음에 해당하는 삭제 연산을 한다.
+	1, 0, -1*/
+
+	int deleteCounter=0;
+	for(int i=0; i<deleteIndexList.size(); i++) {
+		if(deleteIndexList.get(i).equals("1"))
+			deleteCounter++;
+	}
+	beforeDeleting(deleteIndexList); // 삭제해도 될 때만 삭제할 것.
+	// 이 함수를 통해 deleteIndexList의 사이즈가 변할 수 있음.
+/*
+	int adeleteCounter=0;
+	for(int i=0; i<deleteIndexList.size(); i++) {
+		if(deleteIndexList.get(i).equals("1"))
+			adeleteCounter++;
+	}
+	*/	
+	for(int i=0, rowNum = 0; i < dataList.size(); i++) {
+		// 지워도 되는지의 검사 여부 체크하는 함수 필요.
+		if(i % numOfColumns == 0) {// row의 첫번째 index.
+			Data data = dataList.get(i);
+			if(deleteIndexList.get(rowNum).equals("1")) {
+				for(int t=i; t<i+numOfColumns; t++) { 
+					dataList.get(t).setAllowDelete(); // delete해도 된다고 flag를 주는 일.
+				}
+			}
+			rowNum++;
+		} 
+	}	
+	// 이제 실제적으로 지우는 코드.
+	for (int j=dataList.size()-1; j >= 0; j--) {
+		Data data = dataList.get(j);
+		if(data.getAllowDelete() == true) {
+				dataList.remove(j);
+		}
+	}
+
+	// 마무리로 DB에 넣고 빼는 작업.
+	deleteTableForUpdate(dqTable.getTableName());
+	insertTableForUpdate(dqTable);
+	dqTable = null; // 초기화해줘야 됨. 
+
+	int count=0;
+
+	for(int i=0; i<deleteIndexList.size(); i++) {
+		if(deleteIndexList.get(i).equals("1"))
+			count++;
+	 }
+	
+	System.out.println(count + " row(s) are deleted");
+	if(deleteCounter != count) {
+	  	int actualDeleteNum = deleteCounter - count;
+		System.out.println(actualDeleteNum + " row(s) are not deleted due to referential integrity");
+	}
+	   
+}
+
+public static boolean isPutAllowed(Record record, Table referTable, Table targetTable, ArrayList<Data> newList) {
+	/*
+	1. referTable에서 dataList를 가져온다.
+	2. 아까와 같이 foreignKeys가 String으로 encode된 index번호를 return 받는다.
+	3. for loop에서 각각의 컬럼을 다 비교한 후에, 모두 일치하면 각각의 컬럼 값들을 null로 바꿔준다. (O)
+	4. 최종적으로 return 해야됨. (O)		
+	 */
+
+	ArrayList<Data> referDataList = record.getDataList(); // 1.(O)
+	String foreignKeySet = referTable.getForeignKeySet(targetTable.getTableName());
+	String encodedIndex = referTable.getMappedIndex(foreignKeySet);
+	String[] decodedIndex = encodedIndex.split("/");
+	int numOfColumns1 = referTable.getColumnNTLength();
+	int numOfColumns2 = decodedIndex.length;
+
+	ArrayList<String> combinatedList = new ArrayList<String>();
+	/* 비교를 편하게 하기 위해, combinatedList를 만들 필요 있음. */
+
+	for(int k=0; k<newList.size(); k++) {
+
+		String dataCombination = "";
+		
+		if(k % numOfColumns2 == 0) {
+			for(int p=k; p<k+numOfColumns2; p++) {
+			  	String tempData = newList.get(p).getData();
+				dataCombination = dataCombination + tempData + "/";
+			}	
+			combinatedList.add(dataCombination);
+		}
+
+	}
+
+	boolean putAllow = false;
+
+	for(int i=0; i<referDataList.size(); i++) {
+		if(i % numOfColumns1 == 0) { // 한줄씩.
+
+			String dataCombination = "";
+			
+			
+			for(int j=0; j<decodedIndex.length; j++) {
+				int idx = Integer.parseInt(decodedIndex[j]);
+				String tempData = referDataList.get(i+idx).getData();
+			  	if(tempData.contains("'")) {  //&&&&&&&&&&&&&&&&&전면적 수정 필요할 수도 &&&&&&&&&&			  		
+			  		tempData = tempData.substring(1, tempData.length()-1);
+			  	}
+				
+				dataCombination = dataCombination + tempData + "/";
+			 }
+			
+			for(int j=0; j<combinatedList.size(); j++) {
+				if(combinatedList.get(j).equals(dataCombination)) {
+					putAllow = true;
+				 }				
+			 }
+		}
+	}
+
+	return putAllow;
+
+ }
+
+  public static String convertColName(String colName) {
+    String convertedName = "";
+    boolean doesRenameExist = false;
+
+	for(int i=0; i<cRenameList.size(); i++) {
+		if(colName.equals(cRenameList.get(i))) {
+			convertedName = cRenameList.get(i+1);
+			convertedName = convertedName.substring(1, convertedName.length()); // @를 날려버려야 함. 
+			doesRenameExist = true;
+			break;
+		}
+	}
+
+	for(int j=0; j<colName.length(); j++) {
+		if(colName.charAt(j) == '.') {
+			colName = colName.substring(j+1, colName.length());
+		 }
+	}
+
+	if(doesRenameExist)
+		return convertedName.toUpperCase();
+	else
+		return colName.toUpperCase();
+  }
+
+  public static void printSelectedTuples(ArrayList<String> colNameList) {
+	/*
+	colNameList는 selected colName List임. 그래서 반드시 인자로 받아야 함. 
+	*	column개수를 세고,
+	*	여기 들어오는 mergedTable의 record는 날것..
+	*/
+	ArrayList<Data> dataList = mergedTable.getRecord().getDataList();
+	ArrayList<Integer> indexList = null;
+	int numOfColumns = mergedTable.getColumnNTLength();
+
+	String borderLine = "";
+	for(int i=0; i<colNameList.size(); i++) { 
+		 borderLine = borderLine + "+-------------------";
+		 if(i == colNameList.size()-1)
+		 	borderLine = borderLine + "+";	
+	}
+
+	System.out.println(borderLine);
+	/* colName list. */
+	for(int j=0; j<colNameList.size(); j++) { 
+		System.out.print(String.format("%-20s", "| " + convertColName(colNameList.get(j))));
+		 if(j == colNameList.size()-1)
+		 	System.out.println("|");
+	}
+	
+	System.out.println(borderLine);
+	/* mergedTableList. 여기에 들어온 columnList는 legal하다. colNameList의 index를 받아와야 함.
+	   Table에 그런 메소드를 하나 만들자. columnList를 받아서 columnIndexList를 return하는 함수. 
+	*/
+	indexList = mergedTable.getColumnIndexList(colNameList);
+	
+	for(int k=0; k<dataList.size(); k++) {
+		if(k % numOfColumns == 0) {
+			for(int m=0; m < indexList.size(); m++) {
+			  	int idx = indexList.get(m);
+				System.out.print(String.format("%-20s", "| " + dataList.get(k+idx).getData()));
+			}
+			System.out.println("|");
+		}		
+	}
+	
+	System.out.println(borderLine);
+	
+  }
+
+  public static Table mergeTable(ArrayList<Table> tableList) {
+	/* 이 메소드에서는 하나 또는 하나 이상의 테이블을 가지고 있는 tableList가 들어올 때, 그 테이블들을 하나의 테이블로
+		합쳐주는 역할을 한다. 이 메소드는 combineTable의 WrapperMethod에 해당한다. 실제로 cartesian product를
+		수행하는 method는 combineTable임. 		  
+	*/
+
+	// 무조건 tableList.size()가 1 이상이라고 가정.
+	int tableSize = tableList.size(); 
+	Table mergedTable = tableList.get(0);
+	Table targetTable;  
+
+		/* 여기서 들어오는 테이블의 이름을 모두 [table_name].columnname으로 바꿔줘야 한다. */
+		for(int i=0; i<tableList.size(); i++) {
+			Table tempTable = tableList.get(i);
+			ArrayList<columnInfo> columnNT = tempTable.getColumnNT();
+			for(int j=0; j<columnNT.size(); j++) {
+				columnNT.get(j).setColumnName(tempTable.getTableName() + "." + columnNT.get(j).getColumnName());
+			}
+		}
+
+	 
+		if (tableSize == 1) {
+
+			return mergedTable;
+		}
+
+		if (tableSize >= 2) {
+			// recursion을 이용해서 합쳐야 되나?
+						
+			for(int i=1; i<tableSize; i++) {
+		  		targetTable = tableList.get(i);		  	
+				mergedTable = combineTable(mergedTable, targetTable);			
+			}				
+		}
+		return mergedTable;
+  }
+
+  public static Table combineTable(Table fstTable, Table sndTable) {
+		/* 실제로 cartesian product를 수행하는 메소드.
+		[참고]테이블을 cartesian product로 합칠 때, 중복되는 컬럼이 있을 경우 해당 컬럼 name을 rename해서 집어 넣는다.*/
+
+		Table combinedTable = new Table();
+		ArrayList<columnInfo> combinedColumnNT;
+		ArrayList<Data> combinedDataList;
+
+		/* 1. column이 중복될 경우, column name을 rename해주는 부분. */
+		//renameDupColumn(fstTable, sndTable);
+		/* 2. 양 테이블의 columnNT를 합치는 부분. */
+		combinedColumnNT = combineColumnNT(fstTable, sndTable);//
+		/* 3. dataList를 합치는 부분. */
+		combinedDataList = combineDataList(fstTable, sndTable);		
+		/* 4. table에 등록하기 */
+		combinedTable.setColumnNT(combinedColumnNT);
+		combinedTable.getRecord().setDataList(combinedDataList);
+		return combinedTable;
+  }
+	// index out of bounds exception.
+  public static void renameDupColumn(Table fstTable, Table sndTable) {
+		ArrayList<columnInfo> fstColumnList = fstTable.getColumnNT();
+		ArrayList<columnInfo> sndColumnList = sndTable.getColumnNT();
+
+		String fstTableName = fstTable.getTableName();
+		String sndTableName = sndTable.getTableName();
+		columnInfo fstColumnInfo;
+		columnInfo sndColumnInfo;
+		
+		
+		for(int i=0; i<fstColumnList.size(); i++) {
+				fstColumnInfo = fstColumnList.get(i);
+				
+			for(int j=0; j<sndColumnList.size(); j++) {
+				sndColumnInfo = sndColumnList.get(j);
+				// 비교하면 되지롱.
+				if(fstColumnInfo.getColumnName().equals(sndColumnInfo.getColumnName())) {
+					fstColumnInfo.setColumnName(fstTableName + "." + fstColumnInfo.getColumnName());
+					sndColumnInfo.setColumnName(sndTableName + "." + sndColumnInfo.getColumnName());
+					break; // 똑같은 이름은 하나밖에 없으므로, 
+				 }
+			 }
+		}
+  }
+
+  public static ArrayList<columnInfo> combineColumnNT(Table fstTable, Table sndTable) {
+		ArrayList<columnInfo> fstColumnList = fstTable.getColumnNT();
+		ArrayList<columnInfo> sndColumnList = sndTable.getColumnNT();
+		ArrayList<columnInfo> newList = new ArrayList<columnInfo>();
+
+		newList.addAll(fstColumnList);
+		newList.addAll(sndColumnList);
+		return newList;		
+  } 
+
+  /* Cartesian product of two tables. */
+  public static ArrayList<Data> combineDataList(Table fstTable, Table sndTable) {
+		ArrayList<Data> fstDataList = fstTable.getRecord().getDataList();
+		ArrayList<Data> sndDataList = sndTable.getRecord().getDataList();
+
+		int numOfColumns1 = fstTable.getColumnNTLength();
+		int numOfColumns2 = sndTable.getColumnNTLength();
+
+		ArrayList<Data> row1 = new ArrayList<Data>();
+		ArrayList<Data> row2 = new ArrayList<Data>();
+		ArrayList<Data> tempRow = new ArrayList<Data>();
+		ArrayList<Data> resultingList = new ArrayList<Data>();
+
+
+		for(int i=0; i<fstDataList.size(); i++) {
+			if(i % numOfColumns1 == 0) {			  
+				for(int j=i; j<i+numOfColumns1; j++) { 
+					row1.add(fstDataList.get(j));
+				} // 왼쪽에서 한 줄 생성.
+ 				 
+				for(int k=0; k<sndDataList.size();k++) {
+					if(k % numOfColumns2 == 0) {
+						for(int l=k; l<k+numOfColumns2; l++) {
+							row2.add(sndDataList.get(l));
+						} // 오른쪽에서 한줄 생성.
+						
+						concat(tempRow, row1);
+						concat(tempRow, row2);
+						concat(resultingList, tempRow);
+						tempRow.clear(); // initialize
+						row2.clear();																							
+					}
+				}
+				row1.clear();				
+			}
+		}
+
+		return resultingList;		
+  }
+	// 왼쪽에 오른쪽 걸 갖다 붙이는 메소드. 
+  public static void concat(ArrayList<Data> tempRow, ArrayList<Data> row) {
+		for(int i=0; i<row.size(); i++) {
+			tempRow.add(row.get(i));
+		}
+  }
+
+  public static ArrayList<String> getSelectedIndexList(BooleanExpression where) {
+	
+		ArrayList<String> selectedIndexList = new ArrayList<String>(); //(O)
+		ArrayList<Data> mergedDataList = mergedTable.getRecord().getDataList();
+		ArrayList<Data> oneTupleList = new ArrayList<Data>();
+		int numOfColumns = mergedTable.getColumnNTLength();		
+
+		/* columnName과 관련해서 문제가 생길 수 있음. */
+		if(!whereErrorHandler.isThereError()) { 
+			if(where == null) {// 싹 다 출력하면 됨. 			
+				for(int i=0, j=numOfColumns-1; i<mergedDataList.size(); i++) {
+					if(i == j) { // 한 줄이 될 , 
+						selectedIndexList.add("1"); // 대신 count를 세도 된다. 
+						j+= numOfColumns;				
+					}			
+				}						
+			}	
+			else {
+	  /* 여기서 mergedTable에 있는 row를 한 줄씩 가져와서 interpret하면 됨. */ 
+			for(int i=0, j=numOfColumns-1; i<mergedDataList.size(); i++) {
+				oneTupleList.add(mergedDataList.get(i));
+				if(i == j) { // 한 줄이 될 ,					
+					String evaluationResult = where.interpret(oneTupleList, whereErrorHandler);
+					if(evaluationResult.equals("true")) { 
+						selectedIndexList.add("1"); // 대신 count를 세도 된다. 
+					}
+					else { 
+						selectedIndexList.add("0");
+					}
+					j+= numOfColumns;
+					oneTupleList = new ArrayList<Data>(); // initialize
+				
+				}			
+			}
+			}
+			return selectedIndexList;		  
+  	}
+  	return null; // when error detected.
+}
+
+  public static Table selectTuples(ArrayList<String> selectedIndexList) {
+		// 특정 row의 data만 꺼낸 것으로 새로운 dataList를 만들어서 merged Table에 저장하고 그 Table을 return한다.
+
+		ArrayList<Data> dataList = mergedTable.getRecord().getDataList();
+		ArrayList<Data> newDataList = new ArrayList<Data>();
+		int numOfColumns = mergedTable.getColumnNTLength();
+		 
+		for(int i=0, rowNum = 0; i < dataList.size(); i++) {
+
+			if(i % numOfColumns == 0) {
+				if(selectedIndexList.get(rowNum) == "1") {
+					for(int j=i; j<i+numOfColumns; j++) {
+						newDataList.add(dataList.get(j));
+					}					
+				}		
+				rowNum++;
+			}									
+		}
+
+		mergedTable.getRecord().setDataList(newDataList);
+
+		return mergedTable;
+  }
+
+  public static String deleteErrorCheck(String tN, String cN) {
+
+	String holder = null;
+	
+	try { 
+		if(tN != null) { // 숫자나 다른 게 들어올 수 있기 때문. 
+		if(cN == null) { // cN이 null이면 tN이 columnName이라는 뜻.
+			if(!whereErrorHandler.isThereError()) // where절에서 문제가 발생되지 않은 경우에만 컬럼이 존재하는지 여부 체크.
+				if(dqTable.isColumnInTable(tN)) { // 여기서의 tN은 컬럼네임임을 알아야 한다!!!
+				  // do something.
+				} else {
+					whereErrorHandler.errorDetected(3); // columnNotExist
+				}
+
+			holder = tN;
+		} else { // cN이 null이 아니면, tN이 tableName이고 cN이 columnName
+			if(!tN.equals(dqTable.getTableName())) {  // where절에서 다른 테이블을 참조할 경우. WhereTableNotSpecified.
+				whereErrorHandler.errorDetected(2);
+	 		}
+
+			if(!whereErrorHandler.isThereError()) // where절에서 문제가 발생되지 않은 경우에만 컬럼이 존재하는지 여부 체크.
+				if(dqTable.isColumnInTable(cN)) { // 여기서의 tN은 컬럼네임임을 알아야 한다!!!
+				  // do something.
+				} else {
+					whereErrorHandler.errorDetected(3); // columnNotExist
+				}
+
+			holder = holder + "." + cN;		
+		} }
+
+	} catch (Exception e) {
+		System.err.println(e);
+	  }
+	  return holder;
+    }
+
+	/* select 상황에서 where절에서 발생할 수 있는 error 생각해봐야 함. */
+  public static String selectErrorCheck(String tN, String cN) {
+
+	String holder = null;
+	
+	try { 
+		if(tN != null) { // 숫자나 다른 게 들어올 수 있기 때문. 
+		if(cN == null) { // cN이 null이면 tN이 columnName이라는 뜻.
+			if(!whereErrorHandler.isThereError()) {  // where절에서 문제가 발생되지 않은 경우에만 컬럼이 존재하는지 여부 체크.
+
+				//tablename.columnname 구조에서 columnname들의 리스트만 뽑아올 필요가 있음. 
+				ArrayList<String> columnNamesList = mergedTable.getColumnNamesOnly();
+				int sameNameCount = 0;
+
+				/* 이미 컬럼의 이름들은 dot가 붙어 있음. 여기서의 검색은 컬럼이름만을 기준으로 해야 함.*/
+				for(int i=0; i<columnNamesList.size(); i++) {
+					String columnName = columnNamesList.get(i);
+
+					if(columnName.equals(tN))
+						sameNameCount++;					
+				}
+				
+				if(sameNameCount == 0) {
+					whereErrorHandler.errorDetected(3);
+				}
+				if(sameNameCount == 2) {
+					whereErrorHandler.errorDetected(4);
+				 }
+					holder = tN;
+				if(sameNameCount == 1) {
+				  	holder = mergedTable.getColumnNameFully(tN);
+				}
+			}			
+		} else { // cN이 null이 아니면, tN이 tableName이고 cN이 columnName
+
+			if(!whereErrorHandler.isThereError()) // where절에서 문제가 발생되지 않은 경우에만 컬럼이 존재하는지 여부 체크.
+				if(mergedTable.isColumnInTable(tN + "." + cN)) { 
+				  // do something.
+				} else {
+					whereErrorHandler.errorDetected(3); // columnNotExist
+				}
+
+			holder = tN + "." + cN;		// holder + "." + cN을 바꿈.
+		} }
+
+	} catch (Exception e) {
+		System.err.println(e);
+	  }
+	  return holder;
+    }
+	
+  public static ArrayList<String> checkAndGetNewList(ArrayList<String> colNameList) {
+
+		ArrayList<String> fullCNameList = mergedTable.getColumnNamesFully();
+		ArrayList<String> onlyCNameList = mergedTable.getColumnNamesOnly();
+		ArrayList<String> newCNameList = new ArrayList<String>(); 
+		int counter1 = 0;
+		int counter2 = 0;
+
+		for(int i=0; i<colNameList.size(); i++) {
+			String cName = colNameList.get(i);
+			if(cName.contains(".")) {
+				for(int j=0; j<fullCNameList.size(); j++) {
+					if(cName.equals(fullCNameList.get(j))) {
+						counter1 = 1; // 한 개 이상 있을 수가 없음. 
+						break;  
+					}
+				}
+				if(counter1 < 1) { // 존재하지 않는 것. 
+					selectErrorHandler.setNonResolvingColumn(cName);
+					selectErrorHandler.errorDetected(2);
+					break;
+				}
+				counter1 = 0;
+				newCNameList.add(cName);									  
+			}
+			else {
+				for(int j=0; j<onlyCNameList.size(); j++) {
+									  
+					if(cName.equals(onlyCNameList.get(j))) {
+						counter2++; // 한 개 이상 있을 수 있음.    
+					}
+				}
+
+				if(counter2 != 1) {
+					selectErrorHandler.setNonResolvingColumn(cName);
+					selectErrorHandler.errorDetected(2);
+					break;
+				}
+				counter2 = 0;
+				// 위에서 break가 안 걸리면 counter2 원소 개수 하나라는 얘기. 
+
+				for(int j=0; j<onlyCNameList.size(); j++) {
+					if(cName.equals(onlyCNameList.get(j))) {
+						newCNameList.add(fullCNameList.get(j));
+
+						// ArrayList에서 cName찾아서 fullName으로 바꿔줘야 함.
+						for(int k=0; k<cRenameList.size(); k++) {
+							if(cName.equals(cRenameList.get(k))) {
+								cRenameList.set(k, fullCNameList.get(j));
+							 }
+						}
+						
+						break;		    
+					}
+				}				
+			}			
+		}
+		return newCNameList;
+
+  }
+
+  public static void printMessage(int q)
+  {
+    switch(q)
+    {
+      case PRINT_SYNTAX_ERROR:
+      	System.out.println("Syntax error");
+      	break;
+      case PRINT_CREATE_TABLE:
+      	//System.out.println("\'CREATE TABLE\' requested");
+      	break;
+	  case PRINT_DROP_TABLE:
+      	//System.out.println("\'DROP TABLE\' requested");
+      	break;
+      case PRINT_DESC:
+      	//System.out.println("\'DESC\' requested");
+      	break;
+      case PRINT_INSERT:
+      	//System.out.println("\'INSERT\' requested");
+      	break;
+      case PRINT_DELETE:
+      	//System.out.println("\'DELETE\' requested");
+      	break;
+      case PRINT_SELECT:
+      	//System.out.println("\'SELECT\' requested");
+      	break;
+      case PRINT_SHOW_TABLES:
+      	//System.out.println("\'SHOW TABLES\' requested");
+      	break;      	
+ 
+    }
+    System.out.print("DB_2010-12794> ");
+  }
+}
+
+PARSER_END(SimpleDBMSParser)
+
+SKIP : { " " | "\r" | "\t" | "\n" }
+
+TOKEN : /* Keywords */
+{
+  < EXIT : "exit" >
+| < INT : "int" >
+| < CHAR : "char" >
+| < DATE : "date" >
+| < DESC : "desc" >
+| < VALUES : "values">
+| < WHERE : "where" >
+| < SELECT : "select">
+| < AS : "as">
+| < FROM : "from">
+| < REFERENCES : "references" >
+| < CREATE : "create">
+| < DROP : "drop">
+| < TABLE : "table" >
+| < INSERT : "insert" >
+| < INTO : "into" >
+| < DELETE : "delete" >
+| < SHOW : "show" >
+| < TABLES : "tables" >
+| < PRIMARY : "primary" >
+| < FOREIGN : "foreign" >
+| < KEY : "key" >
+
+}
+
+TOKEN :
+{
+  < SEMICOLON : ";" >
+| < LEFT_PAREN : "(" >
+| < RIGHT_PAREN : ")" >
+| < COMMA : "," >
+| < UNDERSCORE : "_" >
+| < INT_VALUE : (< SIGN >)? (< DIGIT >)+>
+| < SIGN : "+" | "-" >
+| < DIGIT : [ "0"-"9" ] >
+| < CHAR_STRING : < QUOTE > (< NON_QUOTE_CHARACTER>)* < QUOTE > >
+| < DATE_VALUE : < NNNN >"-"< NN >"-"< NN > >
+| < NNNN : < DIGIT > < DIGIT > < DIGIT > < DIGIT > >
+| < NN : < DIGIT > < DIGIT > >
+| < NULL : "null">
+| < PERIOD : "." >
+| < AND : "and">
+| < OR : "or">
+| < NOT : "not">
+| < IS : "is">
+| < STAR : "*" >
+| < COMP_OP : "<" | ">" | "=" | ">=" | "<=" | "!=" >
+| < LEGAL_IDENTIFIER : < ALPHABET > (< ALPHABET > | < UNDERSCORE >)* >
+| < ALPHABET : [ "a"-"z","A"-"Z" ] >
+| < NON_QUOTE_CHARACTER : < DIGIT > | < ALPHABET > | < NON_QUOTE_SPECIAL_CHARACTERS > | " " >
+| < QUOTE : "\'" >
+| < NON_QUOTE_SPECIAL_CHARACTERS : "~" | "`" | "!" | "@" | "#" | "$" | "%" |
+								   "^" | "&" | "*" | "." | ">" | "<" | "," |
+								   ";" | "(" | ")" | "+" | "-" | "_" | "=" |
+								   "[" | "]" | "{" | "}" | "|" | "\\"| ":" |
+								   "?" | "/" >
+								   // 30 in total.
+//| < SPACE : " " >
+}
+
+/*
+	At the beginning of processing queries, it holds the table reference and
+	changes are written to this table, and finally reflected in the database only if
+	there is no error.
+*/
+String command(Table tb) :
+{ Token t; }
+{
+  {
+    tb.recycle();
+  }
+  (        queryList(tb)
+  { return "No Exit";}
+| 
+    t = < EXIT >
+    < SEMICOLON >
+   { return t.image;}
+)
+     
+}
+
+void queryList(Table tb) :
+{
+  int q;
+}
+{
+  (
+    q = query(tb) 
+    < SEMICOLON >
+    {
+      printMessage(q); 
+    }
+  )+
+}
+
+int query(Table tb) :
+{
+  int q;
+}
+{
+
+(
+    createTableQuery(tb)
+    {
+      q = PRINT_CREATE_TABLE;
+    }
+| 
+    dropTableQuery()
+    {
+      q = PRINT_DROP_TABLE;
+    }
+|
+	descQuery()
+	{
+	  q = PRINT_DESC; 
+	}
+|
+	insertQuery()
+	{
+	  q = PRINT_INSERT;
+	}
+|
+	deleteQuery()
+	{
+	  q = PRINT_DELETE;
+	}
+|
+    selectQuery()
+    {
+	  q = PRINT_SELECT;
+    }	
+|
+	showTablesQuery()
+	{
+	  q = PRINT_SHOW_TABLES; 
+	}
+) 
+    { return q; }
+  
+}
+/* Queries */
+void createTableQuery(Table tb) :
+{ String tN; }
+{
+  
+  < CREATE >
+  < TABLE >
+  tN = tableName()
+  { 
+    tN = tN.toLowerCase(); // case-insensitive is reflected.
+    tb.setTableName(tN);
+  }
+  tableElementList(tb)
+  {
+    if(doesTableExist(tb.getTableName()) == true) {
+		createErrorHandler.errorDetected(TableExistenceError);
+	}
+    createTable(tb); // The final step of 'create table' query is to call createTable();
+  }
+}
+
+
+void dropTableQuery() :
+{String tN;}
+{
+  < DROP >
+  < TABLE >
+  tN = tableName()
+  {
+    tN = tN.toLowerCase(); // case-insensitive is reflected.
+    dropTable(tN);
+  }
+}
+
+void descQuery() :
+{ String tN; }
+{
+  < DESC >
+  tN = tableName()
+  {
+    tN = tN.toLowerCase(); // case-insensitive is reflected.
+    desc(tN);
+  }
+}
+void showTablesQuery() :
+{}
+{ 
+	< SHOW >
+	< TABLES >
+	{ showTables(); }
+}
+
+/*query를 읽는 도중에 return을 하면 안됨. */
+void insertQuery() :
+{ String tN; Table tempTable;}
+{
+  {
+    insertErrorHandler = new InsertErrorHandler();
+  }
+  < INSERT >
+  < INTO >
+  tN = tableName() {
+
+	if ((tempTable = getTableByName(tN)) == null) {
+	  	insertErrorHandler.errorDetected(1);	
+	}
+  }
+  insertColumnsAndSource(tempTable) {
+
+		insertValues(tempTable); // 최종적으로 발견된 error 출력하게끔.
+  }
+}
+// deleteQuery에서는 전역변수로 선언한 dqTable을 쓰는 것으로 한다. 
+void deleteQuery() :
+{ String tN; BooleanExpression where = null; ArrayList<Data> dqDataList = null; }
+{
+  {
+    deleteErrorHandler = new DeleteErrorHandler();
+    whereErrorHandler = new WhereErrorHandler();
+    selectErrorHandler = new SelectErrorHandler();
+  }
+  (  < DELETE >
+  < FROM >
+  tN = tableName() {
+     	if ((dqTable = getTableByName(tN)) == null) { // dqTable initialize.
+		  	deleteErrorHandler.errorDetected(1);	
+		}
+	}
+  [ where = whereClause() ]
+  )
+  {
+
+    if(!whereErrorHandler.isThereError() && !deleteErrorHandler.isThereError()) { // 이라인바뀜. 
+       // whereClause에서 table또는 columnError발생하면, tree 아예 안 만듦. 
+		//whereErrorHandler.printError();
+
+		dqDataList = dqTable.getRecord().getDataList(); //(O)		
+		int numOfColumns = dqTable.getColumnNTLength(); //(O)
+		ArrayList<Data> oneTupleList = new ArrayList<Data>(); //(O)
+		ArrayList<String> deleteIndexList = new ArrayList<String>(); //(O)
+
+
+		if(where == null) {// 싹 다 지우면 됨. 			
+			for(int i=0, j=numOfColumns-1; i<dqDataList.size(); i++) {
+
+				if(i == j) { // 한 줄이 될 , 
+					deleteIndexList.add("1"); // 대신 count를 세도 된다. 
+					j+= numOfColumns;				
+				}			
+			}						
+		}	
+		else {
+		  	try { 
+		  /* 여기서 dqTable에 있는 row를 한 줄씩 가져와서 interpret하면 됨. */ 
+			for(int i=0, j=numOfColumns-1; i<dqDataList.size(); i++) {
+				
+				oneTupleList.add(dqDataList.get(i));
+				if(i == j) { // 한 줄이 될 ,
+					String evaluationResult = where.interpret(oneTupleList, whereErrorHandler); 
+					if(evaluationResult.equals("true")) {					
+						deleteIndexList.add("1"); // 대신 count를 세도 된다. 
+					}
+					else {
+						deleteIndexList.add("0");
+					}
+					j+= numOfColumns;
+					oneTupleList = new ArrayList<Data>();	
+				}			
+			} } catch(Exception e) {  System.err.println(e);}
+		// for test
+
+	}
+		finalStepToDelete(deleteIndexList);
+	} // end of outermost if.
+
+	if(deleteErrorHandler.isThereError()) {
+		deleteErrorHandler.printError();
+		return;	
+	}
+
+	if(whereErrorHandler.isThereError()) {
+		whereErrorHandler.printError();
+		return;
+	}
+	}
+}
+
+void selectQuery() :
+{ ArrayList<String> colNameList; ArrayList<String> newColumnList = null;}
+{
+  /* 이 단계에서는 tableExpression에서 받은 table에서 selectList에 있는 colName들에 맞춰서 뽑으면 된다. */
+	{ whereErrorHandler = new WhereErrorHandler();
+	  selectErrorHandler = new SelectErrorHandler();
+	  deleteErrorHandler = new DeleteErrorHandler();
+	  cRenameList = new ArrayList<String>();
+	 }
+	< SELECT >
+	colNameList = selectList()
+	mergedTable = tableExpression()
+	{
+	  /* 아래의 함수를 실행하기 전에, colNameList에 있는 모든 column들이 mergedTable에 속해있는지 판단해야 함.
+		다 있으면 OK, 없으면 error.
+		colName의 조건 검사는 여기서 해야 한다. mergedTable이 일단 만들어져야 되기 때문.
+	  */
+		ArrayList<Integer> indexList;
+		
+		if(!selectErrorHandler.isThereError() && !whereErrorHandler.isThereError()) {
+		  	if(colNameList.get(0).equals("*")) {
+				newColumnList = mergedTable.getColumnNamesFully();
+		  	}
+		  	else { 	  	
+				newColumnList = checkAndGetNewList(colNameList); // 이 과정에서 에러 생길 수 있음.
+			}							
+		
+		}
+		if(!selectErrorHandler.isThereError() && !whereErrorHandler.isThereError()) { 
+			indexList = mergedTable.getColumnIndexList(newColumnList);
+			printSelectedTuples(newColumnList);
+
+	 	} else {
+			if(selectErrorHandler.isThereError())
+				selectErrorHandler.printError();
+
+			if(whereErrorHandler.isThereError())
+				whereErrorHandler.printError();			  	 	
+	 	}    
+	}
+}
+  
+ArrayList<String> selectList() :
+{ ArrayList<String> colNameList; String cN; }
+{
+	{
+	  colNameList = new ArrayList<String>();
+	}
+(	    
+	 < STAR >
+	 {
+		colNameList.add("*");
+	 }
+	| (     cN = selectedColumn() { colNameList.add(cN); }
+  	(< COMMA > cN = selectedColumn() { colNameList.add(cN); } )*)
+)
+{
+	return colNameList;  
+}
+}
+
+/*
+   < selectedColumn >
+   In order to avoid 'choice conflict', the original grammar
+   '[tableName() < PERIOD >] columnName() [ < AS > columnName() ]'
+   was changed to the below equivalent format.
+*/
+String selectedColumn() :
+{ String cN1 = null; String cN2 = null; String newName = null; String finalName; }
+{ // as는 나중에 출력할 때만 신경쓰면 될듯.   
+  (    cN1 = tableName()
+  [ < PERIOD > cN2 = columnName() ]
+  [ < AS > newName = columnName() ] // 이름을 columnInfo 같은 데에 등록해놓고, 나중에 출력할 때 새로운 이름이 있으면 그 이름으로 출력한다. 
+  )
+  {
+    if(cN2 == null) {
+		finalName = cN1;
+    } else {
+		finalName = cN1 + "." + cN2;
+    }
+
+	//rename 등록!
+	if(newName != null) { 
+		cRenameList.add(finalName);
+		cRenameList.add ("@" + newName);
+	}
+
+	return finalName;
+		        
+  }
+}
+
+Table tableExpression() :
+{ ArrayList<Table> tableList; BooleanExpression where = null; }
+{
+  tableList = fromClause() {
+    	if(!selectErrorHandler.isThereError() && !whereErrorHandler.isThereError()) { 
+	  		mergedTable = mergeTable(tableList);
+	  	}
+	  // 합친 테이블의 컬럼 정보를 전해줘야 함. whereClause에 전해줘야 함.
+  }
+  [ where = whereClause() ]
+  {
+   	/*
+   		코드가 지저분해질 걸 대비해서, 여기서는 table을 합치는 작업을 하고, where Clause의 조건에 맞는 tuple을 뽑아오는 것까지.
+   	   table을 하나로 합쳐야 하기 때문에, 여기서는 return 형이 Table이다.   	   
+   	*/
+
+	if(!selectErrorHandler.isThereError() && !whereErrorHandler.isThereError()) { 		  	
+   		ArrayList<String> selectedIndexList = getSelectedIndexList(where); // where이 null이 아니여야 함.
+		Table selectedDataTable = selectTuples(selectedIndexList);
+ 	   	
+  		return selectedDataTable; // 임시로.
+  	} else {
+  		return null;
+  	}   	 
+  }
+}
+
+ArrayList<Table> fromClause() :
+{ ArrayList<Table> tableList; }
+{
+  < FROM >
+  tableList = tableReferenceList()
+  {	   
+    return tableList;
+  }
+}
+
+ArrayList<Table> tableReferenceList() :
+{ ArrayList<Table> tableList; Table table; }
+{
+
+  {
+    tableList = new ArrayList<Table>();
+  }
+ (    
+  table = referedTable() {
+    	// table이 DB에 있는지 먼저 확인해봐야 한다.    	
+		tableList.add(table);	
+    }
+  (< COMMA > table = referedTable() {
+    	// table이 DB에 있는지 먼저 확인해봐야 한다.
+		tableList.add(table);
+    })*
+  )
+  {
+		return tableList;
+  }
+    
+}
+
+Table referedTable() :
+{ String tN; String newName; Table table = null;}
+{
+  (    tN = tableName() {
+		table = getTableByName(tN);
+		if(table == null) {
+		  	selectErrorHandler.setNonExistingTable(tN);
+		  	selectErrorHandler.errorDetected(1);
+		} else {
+			// 여기서 table의 모든 Data의 이름을 바꿔줄 필요가 있음.
+			// columnToData를 위해
+			ArrayList<Data> dataList = table.getRecord().getDataList(); 
+			for(int i=0; i<dataList.size(); i++) {
+				Data tempData = dataList.get(i);
+				tempData.setColumnName(tN + "." + tempData.getColumnName());
+			}
+		
+		}		
+   }
+  [< AS > newName = tableName() {
+		if(table !=null)
+			table.setTableName(newName);	
+    }]
+	)
+	{
+	  return table;
+	}
+    
+}
+
+BooleanExpression whereClause() :
+{ BooleanExpression result; }
+{
+  < WHERE >
+  result = booleanValueExpression() {
+	return result;
+  }
+}
+
+/*
+  < booleanValueExpression >
+  In order to avoid 'choice conflict' and allow recursion,
+  the original grammar is changed to the below equivalent format. 
+*/
+
+BooleanExpression booleanValueExpression() :
+{ BooleanExpression term = null; BooleanExpression valueExpression = null; Or or = null;}
+{
+  (    term = booleanTerm()
+   [ < OR > valueExpression = booleanValueExpression() {
+		or = new Or();
+     }]
+   )
+   {
+		if(or == null)
+			return term;
+		else {
+			or.setLeft(term);
+			or.setRight(valueExpression);
+			return or;
+		}
+     }
+}
+
+/*
+  < booleanTerm >
+  In order to avoid 'choice conflict' and allow recursion,
+  the original grammar is changed to the below equivalent format. 
+*/
+
+BooleanExpression booleanTerm() :
+{ BooleanExpression factor = null; BooleanExpression term = null; And and = null; }
+{
+  (    factor = booleanFactor()
+  [< AND > term = booleanTerm() {
+		and = new And();
+    }]
+  )
+  {
+    if(and == null) { 
+    	return factor;
+   	}
+    else {
+		and.setLeft(factor);
+		and.setRight(term);
+		return and;
+    }
+  }
+  
+}
+
+BooleanExpression booleanFactor() :
+{ Not not = null; BooleanExpression tempLeaf; }
+{
+  [< NOT >
+  {
+	not = new Not();
+   }]
+  tempLeaf = booleanTest() {
+    if(not == null)
+    	return tempLeaf;
+    else { 
+    	not.setRight(tempLeaf);
+		return not;	
+	}
+  }
+}
+
+BooleanExpression booleanTest() : // instead of LeafExpression;
+{ BooleanExpression tempLeaf; }
+{	(
+	  tempLeaf = predicate()
+	| tempLeaf = parenthesizedBooleanExpression() //{ tempLeaf = null;}
+	)
+	{
+		return tempLeaf;
+	}
+}
+
+BooleanExpression parenthesizedBooleanExpression() :
+{ BooleanExpression booleanExpression = null; }
+{
+	(
+    < LEFT_PAREN >
+  	booleanExpression = booleanValueExpression()
+ 	< RIGHT_PAREN >
+	)
+  {
+  	return booleanExpression;  
+  }
+}
+
+LeafExpression predicate() :
+{ LeafExpression tempLeaf; }
+{
+  tempLeaf = comparisonAndNullPredicate() {
+	return tempLeaf;
+  }
+}
+
+// 구조 어떻게 바꿀지 생각.
+
+/* < comparisonAndNullPredicate >
+   Originally in the given grammar definition, < comparison predicate > and < null predicate > were separated.
+   However, the separated format caused the problem on the condition of JavaCC's lookahead.
+   That's why I merged the two modules into one < comparisonAndNullPredicate > which works equivalently.  
+*/
+
+LeafExpression comparisonAndNullPredicate() :
+{
+  String fstOperand = null; String sndOperand = null;
+  Token t = null; String trdOperand = null;
+  ArrayList<String> leafAlgebra;
+}
+{
+  	/* 이 format에서 leaf노드 하나에서 평가해야되는 식이 결정됨. */
+	(	  fstOperand = compOperand()
+	  ( t = < COMP_OP > sndOperand = compOperand() | trdOperand = nullOperation())
+	)
+	{
+	  leafAlgebra = new ArrayList<String>();
+	  
+		if(trdOperand == null) {
+			leafAlgebra.add(fstOperand);
+			leafAlgebra.add(t.image);
+		  	leafAlgebra.add(sndOperand);					
+		} else {
+			leafAlgebra.add(fstOperand);
+			leafAlgebra.add(trdOperand);		  
+		}
+		// test.
+
+		LeafExpression leafExpression = new LeafExpression();
+		leafExpression.setLeafAlgebra(leafAlgebra);
+
+		return leafExpression;
+
+	}
+
+}
+
+
+/* 1. compOperand() <comp_op> compOperand()
+   2. compOperand() nullOperation()
+
+   // 이 단계에서는 토큰을 읽은 다음에 비교 대상이 될 수 없는 애들에 대해 미리 거를 수 있다(에러 등록하고). 
+*/
+
+/* returns int_value or char_string or date_value or (!)columnName. */
+/* comOperand가 에러상황에서 return해야 하는 것은?*/
+
+String compOperand() :
+{ String tN = null; String cN = null; String holder = null; Token tHolder = null; }
+{
+  (       tHolder = comparableValue()
+|  tN = tableName()
+  
+	[ < PERIOD > cN = columnName() ]
+  ) {
+
+		if(dqTable != null) {
+		  	if(!deleteErrorHandler.isThereError() && !whereErrorHandler.isThereError()) {   			  	
+				holder = deleteErrorCheck(tN, cN);
+			}
+		}
+		else { //for select.
+			if(!selectErrorHandler.isThereError() && !whereErrorHandler.isThereError() && !deleteErrorHandler.isThereError()) { 
+				holder = selectErrorCheck(tN, cN);
+			}
+		}
+		
+		// 결국에 return해야 하는 것. 
+		if(tHolder == null) {
+			return holder;
+		} else {
+			return tHolder.image;
+		}
+   	
+
+    
+} }
+// tableName이 delete from 뒤에 나오는 테이블과 같은지 먼저 확인한 후, column을 봐야 한다.
+// 에러 등록하는 것까지 일단 짜고 나머지는 나중에 생각해봐야 겠다.
+ 
+Token comparableValue() :
+{ Token t;}
+{
+  (    
+	t = < INT_VALUE >
+|   t = < CHAR_STRING >
+|   t = < DATE_VALUE >
+ )
+{
+  return t;
+}
+}
+
+
+String nullOperation() :
+{ Token t1 = null; Token t2 = null; Token t3 = null; }
+{
+  (    t1 = < IS > [ t2 = <NOT> ] t3 = < NULL>
+  )
+  {
+    if(t2 == null)
+    	return t1.image + " " + t3.image; // will return "is null"
+    else
+    	return t1.image + " " + t2.image + " " + t3.image; // will return "is not null"
+  }
+} 
+
+
+void insertColumnsAndSource(Table tempTable) :
+{ ArrayList<String> cList = null; ArrayList<String> vList; }
+{
+	[		
+	/* columnNameList는 ArrayList<String>을 return 함. */
+		cList = columnNameList()
+		{
+		  /* 여기서 따지는 것은 column이 명시된 경우 */
+		  // tempTable이 null이 아닐 때만 data manipulation을 진행함.
+		  if(!insertErrorHandler.isThereError()) { 
+		  //0. cList의 길이가 columnNT의 길이보다 짧아야 한다.		  		
+				if(cList.size() > tempTable.getColumnNTLength()) {
+					insertErrorHandler.errorDetected(4);
+				 }
+		  //1. cList에 있는 각 원소가, Table에 저장된 column 명과 같은지 확인해야 함. 
+				if(!tempTable.areColumnsInTable(cList)) {				  	
+					insertErrorHandler.errorDetected(5);
+					insertErrorHandler.setNonExistingColumn(tempTable.getColumnNotInTable(cList)); 
+				 }
+
+		   }
+		}
+	] // [ 나중에 처리 ] referential constraint 잘봐야 함. 여기서 없는 columnName 나오면 에러 처리해줘야 됨. 
+	vList = valueList() {
+
+		if(cList != null) { 
+		// 2. vList는 반드시 cList와 길이가 같아야 함.
+		if(!insertErrorHandler.isThereError()) { 
+			if(cList.size() != vList.size()) {
+				insertErrorHandler.errorDetected(4);
+			 }
+			else {
+			  // 3. 위의 조건을 만족시키는데, cList의 길이가 columnNT length보다 짧거나 같은 경우,
+			  //    원래 컬럼의 순서대로 정렬을 해야됨. 이때 빈자리에는 null이 들어감.
+			  if(cList.size() <= tempTable.getColumnNTLength()) {
+					// 만들어야 하는 것은 columnNT의 길이와 같은 Array.
+					// 처음에는 null만 들어간 Array를 만들자.
+					// 그 다음에는 cList의 원소 하나를 인자로 받고 그 원소의 index를 return하는 함수를 정의해서
+					// 해당 위치에 value가 null을 대신해서 들어가게 만들면 됨.
+					ArrayList<String> tempArray = new ArrayList<String>();
+					for(int i=0; i<tempTable.getColumnNTLength(); i++) {
+						tempArray.add("null");	
+					}
+		
+					for(int j=0; j<cList.size(); j++) {
+					  	int targetIndex = tempTable.getColumnIndex(cList.get(j));
+					  	String value = vList.get(j);					  	
+						tempArray.set(targetIndex, value);					  	
+					}
+					record.setColumnConstraint(tempTable.getColumnNT()); // !!!!!!!!!!!!!!!!!!!!!!!!
+			    	record.strArrayToDataArray(tempArray, tempTable); // added to Record member array.
+			    	// 여기까지 하면, 정렬된 dataList가 생성됨.
+				 }
+			}
+		}		
+		} else { // if cList is null, // 모든 element 순서대로 들어와야 함.
+			if(!insertErrorHandler.isThereError()) { 
+			if((vList.size() != tempTable.getColumnNTLength())) {
+				insertErrorHandler.errorDetected(4); 
+			} else {
+			  	record.setColumnConstraint(tempTable.getColumnNT()); // !!!!!!!!!!!!!!!!!!!!!!!!
+				record.strArrayToDataArray(vList, tempTable); // 에러 검출되면, 굳이 record 등록할 필요 없음.
+			}
+			}
+		}
+
+	}
+}
+
+ArrayList<String> valueList() : // (value)* 값을 잘 처리해야됨. // 에러 처리 나중에 고민하고, 일단 값을 넣어 보자.
+{ ArrayList<String> valueHolder; Token t; }
+{
+  {
+    valueHolder = new ArrayList<String>(); 
+  }		< VALUES >
+	< LEFT_PAREN >
+	  t = value() { valueHolder.add(t.image); }
+	( < COMMA >
+	  t = value() { valueHolder.add(t.image); }
+	)*
+	< RIGHT_PAREN >
+	
+	{
+	  return valueHolder;
+	  //record.strArrayToDataArray(valueHolder); // added to Record member array. 
+	  // record 전역변수 객체를 어떻게 운용할 것인가..
+	  // 여기서 record의 legality를 따진 후, 해야됨. 
+	}
+}
+Token value() :
+{ Token t; }
+{
+	(	  t = < NULL >
+	| t = comparableValue()
+	) // 이 괄호 매우 중요.
+{
+	return t;
+}
+}
+
+void tableElementList(Table tb) :
+{}
+{
+  < LEFT_PAREN >
+  tableElement(tb)
+  (
+    < COMMA >
+    tableElement(tb)
+  )*
+  < RIGHT_PAREN >
+}
+
+void tableElement(Table tb) :
+{}
+{
+  columnDefinition(tb)
+| tableConstraintDefinition(tb)
+}
+
+void columnDefinition(Table tb) :
+{ String t1; String t2;}
+{
+  { columnInfo cnt = new columnInfo(); }
+  t1 = columnName()
+  t2 = dataType()
+  (
+    < NOT > < NULL > { cnt.setNotNull(); }
+  )?
+  { 
+  	cnt.setColumnInfo(t1, t2);
+	tb.connectColumnInfo(cnt);
+  }
+}
+
+void tableConstraintDefinition(Table tb) :
+{}
+{
+  primaryKeyConstraint(tb)
+| referentialConstraint(tb)
+}
+
+void primaryKeyConstraint(Table tb) :
+{ ArrayList<String> temp;}
+{
+  < PRIMARY >
+  < KEY >
+  temp = columnNameList()
+  {
+    if(tb.preemptDoublePrimaryKey == 1) {
+		createErrorHandler.errorDetected(DuplicatePrimaryKeyDefError); // errorNum 2.		
+    } else { 
+    	tb.preemptDoublePrimaryKey += 1;
+   	}
+   	
+   	nonExistingColumnCheck(tb, temp);
+	tb.setPrimaryKeys(temp);
+
+  }
+}
+
+void referentialConstraint(Table tb) :
+{ ArrayList<String> l1; ArrayList<String> l2; String tN; }
+{
+  < FOREIGN >
+  < KEY >
+  l1 = columnNameList()
+  < REFERENCES >
+  tN = tableName()
+  l2 = columnNameList()
+
+  { 
+    if(!refRelatedErrorCheck(tb, l1, tN, l2)) {
+      /* Only if there is no error in reference related parts, the following codes are allowed to proceed.*/
+		tb.setForeignKeys(l1);
+		tb.setForeignKeySets(l1, tN);
+		tb.setAnotherFSets(l1);
+		tb.setMappedKeySets(l2, tN);
+        tb.connectReferringInfo(tN); 
+    	refInfoUpdate(tb, tN); 
+    }        
+  }
+}
+
+ArrayList<String> columnNameList() :
+{ ArrayList<String> temp; String str;}
+{
+  { temp = new ArrayList<String>(); }
+  < LEFT_PAREN >
+	str = columnName() { temp.add(str); }
+  (
+    < COMMA >
+    str = columnName() { temp.add(str); }
+  )*
+  < RIGHT_PAREN >
+  {
+	return temp;
+  }
+}
+
+String dataType() :
+{Token t; Token intValue; String refinedValue; }
+{
+  
+  	t = < INT > { return t.image; }
+| (
+    < CHAR > < LEFT_PAREN > intValue = < INT_VALUE > < RIGHT_PAREN >
+    {
+      refinedValue = inspectCharLength(intValue.image);
+      return "char(" + refinedValue + ")";
+    }  
+  )
+|   t = < DATE > { return t.image; }
+
+}
+
+
+String tableName() :
+{Token t;}
+{
+  t = < LEGAL_IDENTIFIER >
+  { return t.image.toLowerCase(); } /* make it sure to return lower-case letter */
+}
+
+String columnName() :
+{Token t;}
+{
+  t = < LEGAL_IDENTIFIER >
+  { return t.image.toLowerCase();} /* make it sure to return lower-case letter */
+}

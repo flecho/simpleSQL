@@ -1,0 +1,106 @@
+// not nullable 고쳐야됨
+
+create table d (id int, name char(10), primary key(id, name));
+create table e (id int, name char(10), foreign key (id, name) references d (id, name));
+insert into d values (1, 'a');
+insert into d values (1, 'a'); // primary dup drror
+insert into d values (2, 'b');
+insert into d values (3, 'c');
+select * from d;
+select id, name as T from d;
+
+insert into e values (1, 'a');
+insert into e values (1, 'b'); // referential integrity error
+insert into e values (2, 'b');
+
+delete from d where id = 1; // 하면 d에 있는 게 지워지고, e에 있는 게 null로 바뀌어야 함. 
+
+create table f (id int not null, name char(10), foreign key (id, name) references e (id, name)); // error
+create table f (id int not null, name char(10), foreign key (id, name) references d (id, name));
+insert into d values (1, 'a');
+insert into f values (1, 'a');
+insert into f values (1, 'b'); // primary error
+insert into f values (2, 'b');
+
+delete from d where id = 1; // 0 row(s) are deleted // 1 row(s) are not deleted due to referential integrity.
+
+/* delete 관련 */
+create table james (id int, name char(10), salary int, primary key (id, name));
+create table mcaboy (id int not null, name char(10), foreign key (id, name) references james (id, name));
+create table mc (id int not null, name char(10), foreign key (id, name) references james (id, name));
+insert into james values (1, 'a', null);
+insert into james values (1, 'b', 5000);
+insert into james values (1, 'c', 25000);
+select * from james where salary>=10000; // null이 튀어나오면 안됨.
+select * from james where not salary>=10000; // 역시 null이 튀어나오면 안됨. 
+insert into mc values (1, 'a');
+insert into mc values (1, 'b');
+insert into mcaboy values (1, 'a');
+delete from james where id=1; // (1, 'c')만 지워져야 됨. 나머지 두개가 낫널컨스트레인트. 
+
+/* truncate 관련 에러 처리 */
+create table tiger (id int, name char(4), primary key (id));
+insert into tiger values (2, 'dragon');
+insert into tiger values (2, 'dragonfly'); // primary dup error. 
+
+/* null 비교 관련 */
+create table lion (name char(4));
+insert into lion values (null);
+insert into lion values (null);
+insert into lion values (null);
+insert into lion values (null);
+insert into lion values (null);
+insert into lion values (null);
+select * from lion where lion.name = 20; // 빈 셀렉트 결과 ..null이 있으므로 비교 자체는 가능. 
+select * from lion where name = 2010-12-20; // 빈 셀렉트 결과
+insert into lion values ('sexy lion'); 
+select * from lion where name = 20; // Where clause try to incomparable error.
+select * from lion where name = 2010-12-20; // Where clause try to incomparable error.
+select * from lion where not name = 20;
+
+
+soldier76 비교 못하는 문제.
+
+create table datecomp (id int, day date);
+insert into datecomp values (1, 2010-03-17);
+insert into datecomp values (2, 2010-03-18);
+insert into datecomp values (3, 2010-04-15);
+insert into datecomp values (4, 1991-05-18);
+
+select id from datecomp where day > 2010-03-18; // 3이 나와야 함.
+select id from datecomp where day > 1991-04-09; // 네 개 다 나와야 함.
+select id from datecomp where datecomp.day is null; // 0개 나와야 함.
+select id from datecomp where (day > 1991-04-09) and (datecomp.day < 2010-04-09); // 1,2,4 나와야 함.
+select id from datecomp where (day > 1991-04-09) and (day < 2010-04-09) and id != 4; // 1, 2 나와야 함.
+
+
+// nullable test
+create table nonono (id int, when date, primary key (when));
+insert into nonono values (1, 2010-04-17);
+insert into nonono values (2, 2010-05-17);
+insert into nonono values (3, 2010-06-17);
+insert into nonono values (1, 2010-06-17); // primary dup error.
+create table hololo (id int, salary int, name char(20), when date, foreign key (when) references nonono (when));
+insert into hololo values (1, 10000, 'Joonsang', 2010-05-16); // referential integrity error
+insert into hololo values (1, 10000, 'Joonsang', 2010-05-17); ok.
+insert into hololo values (1, 10000, 'Soonyoung', 2010-06-17);
+insert into hololo values (1, 10000, 'Sanghoon', 2010-05-17); ok.
+select * from hololo;
+delete from nonono where when=2010-05-17;
+select * from hololo; // Joonsang, Sanghoon value turned into null.
+select * from nonono, hololo;
+select * from nonono, hololo where name = 'Joonsang';
+select * from nonono, hololo where hololo.name = 'Sanghoon';
+select * from nonono, hololo where nonono.name = 'Sanghoon'; (X)
+
+create table hihi (id int, name char(20));
+create table kiki (id int, name char(20));
+insert into hihi values (1, 'JeongYumi');
+insert into hihi values (2, 'Eric');
+insert into hihi values (3, 'KimSeulgi');
+insert into hihi values (4, 'DoMinjun');
+insert into kiki values (1, 'Michael');
+insert into kiki values (2, 'James');
+insert into kiki values (3, 'Tom');
+insert into kiki values (4, 'Zidane');
+select * from hihi,kiki where id = 4;
